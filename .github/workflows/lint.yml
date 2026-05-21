@@ -1,0 +1,71 @@
+name: Lint & Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18.x'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run ESLint
+      run: npx eslint . --ext .js --format=json --output-file=eslint-report.json || true
+      continue-on-error: true
+
+    - name: Comment PR with lint results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          try {
+            const report = JSON.parse(fs.readFileSync('./eslint-report.json', 'utf8'));
+            const errors = report.reduce((acc, f) => acc + f.messages.length, 0);
+            
+            if (errors > 0) {
+              const message = `## ⚠️ Lint Issues Found
+              
+              Found **${errors}** linting issues. Please review and fix.`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: message
+              });
+            }
+          } catch (e) {
+            console.log('No lint report found');
+          }
+      continue-on-error: true
+
+    - name: Check code formatting with Prettier
+      run: npx prettier --check . --ignore-path=.gitignore --ignore-unknown || true
+      continue-on-error: true
+
+    - name: Security audit
+      run: npm audit --audit-level=moderate || true
+      continue-on-error: true
+
+    - name: Upload lint report
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: lint-report
+        path: eslint-report.json
+        retention-days: 30
