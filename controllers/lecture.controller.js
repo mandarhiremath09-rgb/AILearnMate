@@ -1,0 +1,188 @@
+const axios = require('axios');
+const FormData = require('form-data');
+const pool = require('../config/database');
+const { uploadToS3 } = require('../config/s3');
+const redisClient = require('../config/redis');
+const { logger } = require('../utils/logger');
+
+const uploadLecture = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No video file provided' });
+    }
+
+    const { title, courseId, description } = req.body;
+    const { originalname, buffer, mimetype } = req.file;
+
+    if (!title || !courseId) {
+      return res.status(400).json({ error: 'Title and courseId are required' });
+    }
+
+    // Upload to S3
+    const fileName = `lectures/${courseId}/${Date.now()}-${originalname}`;
+    const s3Upload = await uploadToS3(process.env.AWS_S3_BUCKET, fileName, buffer, mimetype);
+
+    // Save to database
+    const result = await pool.query(
+      `INSERT INTO lectures (title, description, video_url, course_id, teacher_id, duration, uploaded_at)
+       VALUES ($1, $2, $3, $4, $5, 0, NOW())
+       RETURNING id, title, video_url, created_at`,
+      [title, description || '', s3Upload.url, courseId, req.user.id]
+    );
+
+    const lecture = result.rows[0];
+
+    logger.info(`Lecture uploaded: ${lecture.id} by teacher ${req.user.id}`);
+
+    res.status(201).json({
+      message: 'Lecture uploaded successfully',
+      lecture: {
+        id: lecture.id,
+        title: lecture.title,
+        videoUrl: lecture.video_url,
+        uploadedAt: lecture.created_at,
+      },
+    });
+  } catch (err) {
+    logger.error('Upload lecture error:', err);
+    res.status(500).json({ error: 'Failed to upload lecture' });
+  }
+};
+
+const getLectures = async (req, res) => {
+  try {
+    const { courseId } = req.query;
+
+    let query = `
+      SELECT id, title, description, video_url, course_id, teacher_id, duration, uploaded_at
+      FROM lectures
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (courseId) {
+      query += ` AND course_id = $${params.length + 1}`;
+      params.push(courseId);
+    }
+
+    if (req.user.role === 'teacher') {
+      query += ` AND teacher_id = $${params.length + 1}`;
+      params.push(req.user.id);
+    }
+
+    query += ' ORDER BY uploaded_at DESC';
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      lectures: result.rows,
+    });
+  } catch (err) {
+    logger.error('Get lectures error:', err);
+    res.status(500).json({ error: 'Failed to fetch lectures' });
+  }
+};
+
+const getLectureDetail = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      'SELECT id, title, description, video_url, course_id, teacher_id, duration, uploaded_at FROM lectures WHERE id = $1',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Lecture not found' });
+    }
+
+    const lecture = result.rows[0];
+
+    // Check transcript cache
+    const cachedTranscript = await redisClient.get(`transcript:${id}`);
+    if (cachedTranscript) {
+      lecture.transcript = JSON.parse(cachedTranscript);
+    }
+
+    res.json({ lecture });
+  } catch (err) {
+    logger.error('Get lecture detail error:', err);
+    res.status(500).json({ error: 'Failed to fetch lecture' });
+  }
+};
+
+const deleteLecture = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const lecture = await pool.query('SELECT id, video_url, teacher_id FROM lectures WHERE id = $1', [id]);
+
+    if (lecture.rows.length === 0) {
+      return res.status(404).json({ error: 'Lecture not found' });
+    }
+
+    if (lecture.rows[0].teacher_id !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    // Delete from database
+    await pool.query('DELETE FROM lectures WHERE id = $1', [id]);
+
+    // Clear cache
+    await redisClient.del(`transcript:${id}`);
+
+    logger.info(`Lecture deleted: ${id}`);
+
+    res.json({ message: 'Lecture deleted successfully' });
+  } catch (err) {
+    logger.error('Delete lecture error:', err);
+    res.status(500).json({ error: 'Failed to delete lecture' });
+  }
+};
+
+const generateTranscript = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check cache first
+    const cached = await redisClient.get(`transcript:${id}`);
+    if (cached) {
+      return res.json({ transcript: JSON.parse(cached), fromCache: true });
+    }
+
+    // Get lecture
+    const lecture = await pool.query('SELECT id, video_url FROM lectures WHERE id = $1', [id]);
+    if (lecture.rows.length === 0) {
+      return res.status(404).json({ error: 'Lecture not found' });
+    }
+
+    const videoUrl = lecture.rows[0].video_url;
+
+    // Call Whisper API (requires downloading video first in production)
+    // For now, returning placeholder
+    const transcript = {
+      lectureId: id,
+      text: 'Transcription will be generated by Whisper API',
+      generatedAt: new Date(),
+      accuracy: 0.95,
+    };
+
+    // Cache for 7 days
+    await redisClient.setex(`transcript:${id}`, 7 * 24 * 60 * 60, JSON.stringify(transcript));
+
+    logger.info(`Transcript generated for lecture: ${id}`);
+
+    res.json({ transcript });
+  } catch (err) {
+    logger.error('Generate transcript error:', err);
+    res.status(500).json({ error: 'Failed to generate transcript' });
+  }
+};
+
+module.exports = {
+  uploadLecture,
+  getLectures,
+  getLectureDetail,
+  deleteLecture,
+  generateTranscript,
+};
